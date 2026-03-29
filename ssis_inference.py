@@ -54,7 +54,6 @@ class SSISv2Detector:
         confidence_threshold: float = 0.3,
         device: str = "cuda",
     ):
-        from detectron2.config import get_cfg
         from adet.config import get_cfg as get_adet_cfg
 
         if config_file is None:
@@ -71,8 +70,7 @@ class SSISv2Detector:
                 / "model_ssisv2_final.pth"
             )
 
-        cfg = get_cfg()
-        get_adet_cfg(cfg)
+        cfg = get_adet_cfg()
         cfg.merge_from_file(config_file)
         cfg.MODEL.WEIGHTS = weights_path
         cfg.MODEL.RETINANET.SCORE_THRESH_TEST = confidence_threshold
@@ -104,6 +102,8 @@ class SSISv2Detector:
             }
         """
         outputs = self.predictor(image_bgr)
+        if isinstance(outputs, list):
+            outputs = outputs[0]
         instances = outputs["instances"].to("cpu")
 
         if not hasattr(instances, "pred_associations"):
@@ -112,7 +112,8 @@ class SSISv2Detector:
         masks = instances.pred_masks.numpy()  # (N, H, W)
         classes = instances.pred_classes.numpy()  # (N,) 0=shadow, 1=object
         scores = instances.scores.numpy()  # (N,)
-        associations = instances.pred_associations.numpy()  # (N,)
+        assoc_raw = instances.pred_associations
+        associations = np.array(assoc_raw) if isinstance(assoc_raw, list) else assoc_raw.numpy()  # (N,)
 
         # Group by association ID
         pairs = {}

@@ -1,0 +1,17 @@
+# Cloned dependencies
+SSIS/
+sam2/
+gen-omnimatte-public/
+
+# Outputs
+output/
+output_bench/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+*.egg
+
+# IDE / tool
+.claude/

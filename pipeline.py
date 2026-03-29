@@ -18,14 +18,15 @@ import numpy as np
 from pathlib import Path
 
 
-def extract_frames(video_path: str, output_dir: str) -> int:
-    """Extract video frames as JPEG files. Returns total frame count."""
+def extract_frames(video_path: str, output_dir: str) -> tuple[int, float]:
+    """Extract video frames as JPEG files. Returns (total frame count, fps)."""
     os.makedirs(output_dir, exist_ok=True)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
 
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_count = 0
     while True:
         ret, frame = cap.read()
@@ -36,8 +37,26 @@ def extract_frames(video_path: str, output_dir: str) -> int:
         frame_count += 1
 
     cap.release()
-    print(f"Extracted {frame_count} frames to {output_dir}")
-    return frame_count
+    print(f"Extracted {frame_count} frames to {output_dir} (fps={fps:.2f})")
+    return frame_count, fps
+
+
+def write_video(frames_dir: str, output_path: str, fps: float):
+    """Write JPEG frames to an H.264 MP4 video file using ffmpeg."""
+    import subprocess
+
+    frame_pattern = os.path.join(frames_dir, "%05d.jpg")
+    cmd = [
+        "ffmpeg", "-y",
+        "-framerate", str(fps),
+        "-i", frame_pattern,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-crf", "18",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 
 def save_masks(
@@ -60,14 +79,15 @@ def save_masks(
         "total_frames": len(video_segments),
     }
     for pair in pair_info:
-        meta["pairs"].append(
-            {
-                "shadow_obj_id": pair["shadow_obj_id"],
-                "object_obj_id": pair["object_obj_id"],
-                "shadow_score": pair["shadow_score"],
-                "object_score": pair["object_score"],
-            }
-        )
+        entry = {
+            "shadow_obj_id": pair["shadow_obj_id"],
+            "object_obj_id": pair["object_obj_id"],
+            "shadow_score": pair["shadow_score"],
+            "object_score": pair["object_score"],
+        }
+        if "keyframe" in pair:
+            entry["keyframe"] = pair["keyframe"]
+        meta["pairs"].append(entry)
 
     meta_path = os.path.join(output_dir, "pairs.json")
     with open(meta_path, "w") as f:
@@ -112,11 +132,36 @@ def visualize_frame(
     return vis
 
 
+def _compute_mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    """Compute IoU between two boolean masks."""
+    intersection = np.logical_and(mask_a, mask_b).sum()
+    union = np.logical_or(mask_a, mask_b).sum()
+    if union == 0:
+        return 0.0
+    return float(intersection / union)
+
+
+def _get_keyframe_indices(
+    frame_count: int,
+    keyframes: list[int] | None,
+    keyframe_interval: int | None,
+) -> list[int]:
+    """Determine which frames to run SSISv2 on."""
+    if keyframes is not None:
+        return sorted(set(kf for kf in keyframes if 0 <= kf < frame_count))
+    if keyframe_interval is not None and keyframe_interval > 0:
+        return list(range(0, frame_count, keyframe_interval))
+    return [0]
+
+
 def run_pipeline(
     video_path: str,
     output_dir: str,
     keyframe_idx: int = 0,
+    keyframes: list[int] | None = None,
+    keyframe_interval: int | None = None,
     confidence_threshold: float = 0.3,
+    iou_threshold: float = 0.3,
     sam2_model_size: str = "large",
     device: str = "cuda",
     save_visualization: bool = True,
@@ -127,8 +172,11 @@ def run_pipeline(
     Args:
         video_path: Path to input video file.
         output_dir: Directory to save results.
-        keyframe_idx: Frame index for SSISv2 detection (default: first frame).
+        keyframe_idx: Frame index for SSISv2 detection (single keyframe, legacy).
+        keyframes: List of frame indices for SSISv2 detection.
+        keyframe_interval: Run SSISv2 every N frames (alternative to keyframes).
         confidence_threshold: SSISv2 detection threshold.
+        iou_threshold: IoU threshold to consider a detection as duplicate.
         sam2_model_size: SAM2 model size (tiny/small/base_plus/large).
         device: CUDA device.
         save_visualization: Whether to save visualized overlay frames.
@@ -139,60 +187,92 @@ def run_pipeline(
     # --- Step 1: Extract frames ---
     print("=" * 50)
     print("[Step 1/4] Extracting video frames...")
-    frame_count = extract_frames(video_path, frames_dir)
+    frame_count, fps = extract_frames(video_path, frames_dir)
 
-    if keyframe_idx >= frame_count:
-        raise ValueError(
-            f"keyframe_idx={keyframe_idx} exceeds frame count={frame_count}"
-        )
+    # Determine keyframes
+    if keyframes is None and keyframe_interval is None:
+        kf_indices = [keyframe_idx]
+    else:
+        kf_indices = _get_keyframe_indices(frame_count, keyframes, keyframe_interval)
 
-    # --- Step 2: SSISv2 detection on keyframe ---
+    for kf in kf_indices:
+        if kf >= frame_count:
+            raise ValueError(f"keyframe={kf} exceeds frame count={frame_count}")
+
+    print(f"  Keyframes: {kf_indices}")
+
+    # --- Step 2: SSISv2 detection on keyframes ---
     print("=" * 50)
-    print(f"[Step 2/4] Running SSISv2 on frame {keyframe_idx}...")
+    print(f"[Step 2/4] Running SSISv2 on {len(kf_indices)} keyframe(s)...")
     from ssis_inference import SSISv2Detector
 
     detector = SSISv2Detector(
         confidence_threshold=confidence_threshold, device=device
     )
 
-    keyframe_path = os.path.join(frames_dir, f"{keyframe_idx:05d}.jpg")
-    keyframe_image = cv2.imread(keyframe_path)
-    pairs = detector.detect(keyframe_image)
+    # Detect on each keyframe and deduplicate
+    next_pair_id = 0
+    keyframe_masks = {}   # {frame_idx: {obj_id: mask}}
+    pair_info = []        # list of pair dicts
+    all_object_masks = [] # track all assigned object masks for dedup
 
-    print(f"  Detected {len(pairs)} shadow-object pair(s)")
-    if len(pairs) == 0:
-        print("  No pairs detected. Try lowering --threshold or using a different keyframe.")
+    for kf_idx in kf_indices:
+        kf_path = os.path.join(frames_dir, f"{kf_idx:05d}.jpg")
+        kf_image = cv2.imread(kf_path)
+        pairs = detector.detect(kf_image)
+        print(f"  Frame {kf_idx}: detected {len(pairs)} pair(s)")
+
+        new_masks = {}
+        for pair in pairs:
+            # Check if this pair's object overlaps with any already-tracked object
+            is_duplicate = False
+            for existing_mask in all_object_masks:
+                iou = _compute_mask_iou(pair["object_mask"], existing_mask)
+                if iou >= iou_threshold:
+                    is_duplicate = True
+                    break
+
+            if is_duplicate:
+                print(f"    Skipping duplicate pair (IoU >= {iou_threshold:.2f})")
+                continue
+
+            shadow_id = next_pair_id * 2
+            object_id = next_pair_id * 2 + 1
+            new_masks[shadow_id] = pair["shadow_mask"]
+            new_masks[object_id] = pair["object_mask"]
+            pair_info.append(
+                {
+                    "shadow_obj_id": shadow_id,
+                    "object_obj_id": object_id,
+                    "shadow_score": pair["shadow_score"],
+                    "object_score": pair["object_score"],
+                    "keyframe": kf_idx,
+                }
+            )
+            all_object_masks.append(pair["object_mask"])
+            print(
+                f"    Pair {next_pair_id}: shadow(id={shadow_id}) + object(id={object_id}) "
+                f"scores=({pair['shadow_score']:.3f}, {pair['object_score']:.3f}) "
+                f"[keyframe={kf_idx}]"
+            )
+            next_pair_id += 1
+
+        if new_masks:
+            keyframe_masks[kf_idx] = new_masks
+
+    total_pairs = len(pair_info)
+    print(f"  Total unique pairs: {total_pairs}")
+    if total_pairs == 0:
+        print("  No pairs detected. Try lowering --threshold or adjusting keyframes.")
         return
 
-    # --- Step 3: Prepare masks for SAM2 ---
+    # --- Step 3: SAM2 propagation ---
     print("=" * 50)
     print("[Step 3/4] Propagating masks with SAM2 Video Predictor...")
     from sam2_propagate import SAM2VideoPropagator
 
-    # Assign unique obj_ids: even=shadow, odd=object
-    initial_masks = {}
-    pair_info = []
-    for i, pair in enumerate(pairs):
-        shadow_id = i * 2
-        object_id = i * 2 + 1
-        initial_masks[shadow_id] = pair["shadow_mask"]
-        initial_masks[object_id] = pair["object_mask"]
-        pair_info.append(
-            {
-                "shadow_obj_id": shadow_id,
-                "object_obj_id": object_id,
-                "shadow_score": pair["shadow_score"],
-                "object_score": pair["object_score"],
-            }
-        )
-        print(
-            f"  Pair {i}: shadow(id={shadow_id}) + object(id={object_id}) "
-            f"scores=({pair['shadow_score']:.3f}, {pair['object_score']:.3f})"
-        )
-
-    # --- Step 4: SAM2 propagation ---
     propagator = SAM2VideoPropagator(model_size=sam2_model_size, device=device)
-    video_segments = propagator.propagate(frames_dir, initial_masks, keyframe_idx)
+    video_segments = propagator.propagate_multi(frames_dir, keyframe_masks)
 
     print(f"  Propagated to {len(video_segments)} frames")
 
@@ -213,6 +293,11 @@ def run_pipeline(
             cv2.imwrite(vis_path, vis)
         print(f"  Saved visualization to {vis_dir}")
 
+        # Write visualization video
+        vis_video_path = os.path.join(output_dir, "visualization.mp4")
+        write_video(vis_dir, vis_video_path, fps)
+        print(f"  Saved visualization video to {vis_video_path}")
+
     print("=" * 50)
     print("Done!")
     print(f"  Pairs: {len(pair_info)}")
@@ -227,10 +312,22 @@ def main():
     parser.add_argument("--video", required=True, help="Input video path")
     parser.add_argument("--output", default="./output", help="Output directory")
     parser.add_argument(
-        "--keyframe", type=int, default=0, help="Keyframe index for SSISv2 detection"
+        "--keyframe", type=int, default=0, help="Keyframe index for SSISv2 detection (single)"
+    )
+    parser.add_argument(
+        "--keyframes", type=str, default=None,
+        help="Comma-separated keyframe indices (e.g., '0,30,60'). Overrides --keyframe.",
+    )
+    parser.add_argument(
+        "--keyframe-interval", type=int, default=None,
+        help="Run SSISv2 every N frames (e.g., 30). Overrides --keyframe.",
     )
     parser.add_argument(
         "--threshold", type=float, default=0.3, help="SSISv2 confidence threshold"
+    )
+    parser.add_argument(
+        "--iou-threshold", type=float, default=0.3,
+        help="IoU threshold for deduplicating detections across keyframes",
     )
     parser.add_argument(
         "--sam2-model",
@@ -244,11 +341,18 @@ def main():
     )
     args = parser.parse_args()
 
+    keyframes = None
+    if args.keyframes is not None:
+        keyframes = [int(x.strip()) for x in args.keyframes.split(",")]
+
     run_pipeline(
         video_path=args.video,
         output_dir=args.output,
         keyframe_idx=args.keyframe,
+        keyframes=keyframes,
+        keyframe_interval=args.keyframe_interval,
         confidence_threshold=args.threshold,
+        iou_threshold=args.iou_threshold,
         sam2_model_size=args.sam2_model,
         device=args.device,
         save_visualization=not args.no_vis,

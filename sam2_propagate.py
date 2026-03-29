@@ -40,14 +40,26 @@ class SAM2VideoPropagator:
         self.offload_video_to_cpu = offload_video_to_cpu
         self.offload_state_to_cpu = offload_state_to_cpu
 
-        config_path = str(SAM2_ROOT / SAM2_CONFIGS[model_size])
+        config_rel = SAM2_CONFIGS[model_size]
         checkpoint_path = str(SAM2_ROOT / SAM2_CHECKPOINTS[model_size])
+
+        # Initialize Hydra with sam2's config directory
+        # Configs live inside the sam2 Python package: sam2/sam2/configs/
+        from hydra import initialize_config_dir
+        from hydra.core.global_hydra import GlobalHydra
+        if GlobalHydra.instance().is_initialized():
+            GlobalHydra.instance().clear()
+        # config_rel is like "configs/sam2.1/sam2.1_hiera_l.yaml"
+        # The actual configs are at SAM2_ROOT/sam2/configs/sam2.1/
+        config_dir = str(SAM2_ROOT / "sam2" / os.path.dirname(config_rel))
+        config_name = os.path.basename(config_rel)
 
         from sam2.build_sam import build_sam2_video_predictor
 
-        self.predictor = build_sam2_video_predictor(
-            config_path, checkpoint_path, device=self.device
-        )
+        with initialize_config_dir(config_dir=config_dir, version_base="1.2"):
+            self.predictor = build_sam2_video_predictor(
+                config_name, checkpoint_path, device=self.device
+            )
 
     def propagate(
         self,
@@ -56,13 +68,30 @@ class SAM2VideoPropagator:
         keyframe_idx: int = 0,
     ) -> dict[int, dict[int, np.ndarray]]:
         """
-        Propagate initial masks across all video frames.
+        Propagate initial masks across all video frames (single keyframe).
 
         Args:
             frames_dir: Directory containing JPEG frames (00000.jpg, 00001.jpg, ...)
             initial_masks: {obj_id: mask} where mask is (H, W) bool array.
-                           obj_ids should be unique integers for each tracked region.
             keyframe_idx: Frame index where initial_masks are defined.
+
+        Returns:
+            {frame_idx: {obj_id: mask}} for all frames.
+        """
+        return self.propagate_multi(frames_dir, {keyframe_idx: initial_masks})
+
+    def propagate_multi(
+        self,
+        frames_dir: str,
+        keyframe_masks: dict[int, dict[int, np.ndarray]],
+    ) -> dict[int, dict[int, np.ndarray]]:
+        """
+        Propagate masks from multiple keyframes across all video frames.
+
+        Args:
+            frames_dir: Directory containing JPEG frames (00000.jpg, 00001.jpg, ...)
+            keyframe_masks: {frame_idx: {obj_id: mask}}
+                Each mask is a (H, W) bool array.
 
         Returns:
             {frame_idx: {obj_id: mask}} for all frames.
@@ -77,16 +106,17 @@ class SAM2VideoPropagator:
                 offload_state_to_cpu=self.offload_state_to_cpu,
             )
 
-            # Add all initial masks on the keyframe
-            for obj_id, mask in initial_masks.items():
-                self.predictor.add_new_mask(
-                    inference_state=inference_state,
-                    frame_idx=keyframe_idx,
-                    obj_id=obj_id,
-                    mask=mask,
-                )
+            # Add masks at each keyframe
+            for kf_idx, masks in keyframe_masks.items():
+                for obj_id, mask in masks.items():
+                    self.predictor.add_new_mask(
+                        inference_state=inference_state,
+                        frame_idx=kf_idx,
+                        obj_id=obj_id,
+                        mask=mask,
+                    )
 
-            # Propagate forward
+            # Propagate forward through the video
             video_segments = {}
             for frame_idx, obj_ids, mask_logits in self.predictor.propagate_in_video(
                 inference_state
@@ -96,6 +126,20 @@ class SAM2VideoPropagator:
                     video_segments[frame_idx][int(obj_id)] = (
                         (mask_logits[i] > 0.0).squeeze(0).cpu().numpy()
                     )
+
+            # Propagate backward to cover frames before later keyframes
+            for frame_idx, obj_ids, mask_logits in self.predictor.propagate_in_video(
+                inference_state, reverse=True
+            ):
+                if frame_idx not in video_segments:
+                    video_segments[frame_idx] = {}
+                for i, obj_id in enumerate(obj_ids):
+                    oid = int(obj_id)
+                    # Backward results fill in gaps; don't overwrite forward results
+                    if oid not in video_segments[frame_idx]:
+                        video_segments[frame_idx][oid] = (
+                            (mask_logits[i] > 0.0).squeeze(0).cpu().numpy()
+                        )
 
         return video_segments
 
